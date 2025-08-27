@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, render_template_string, redirect, url_for
+from flask import Flask, request, jsonify, render_template_string, redirect, url_for 
 import asyncio
 import json
 from datetime import datetime
@@ -620,3 +620,261 @@ DETAILED_HTML = '''
 </body>
 </html>
 '''
+# Add these routes to your app.py file after the existing code
+
+@app.route('/')
+def dashboard():
+    """Main dashboard"""
+    try:
+        # Get active prompt info
+        active_prompt_name = None
+        if analyzer.active_prompt_id and analyzer.active_prompt_id in analyzer.system_prompts:
+            active_prompt_name = analyzer.system_prompts[analyzer.active_prompt_id]['name']
+        
+        # Get recent analyses
+        recent_analyses = list(analyzer.call_analyses.values())[-10:]  # Last 10 analyses
+        recent_analyses.reverse()  # Most recent first
+        
+        # Calculate stats
+        analyzed_count = len(analyzer.call_analyses)
+        scores = [a.get('performance_score', 0) for a in analyzer.call_analyses.values()]
+        avg_score = sum(scores) / len(scores) if scores else None
+        
+        return render_template_string(DASHBOARD_HTML, 
+            active_prompt_name=active_prompt_name,
+            recent_analyses=recent_analyses,
+            analyzed_count=analyzed_count,
+            avg_score=avg_score
+        )
+    except Exception as e:
+        return f"Dashboard error: {str(e)}", 500
+
+@app.route('/prompts')
+def prompts():
+    """System prompts management"""
+    try:
+        prompts_list = list(analyzer.system_prompts.values())
+        prompts_list.sort(key=lambda x: x['created_at'], reverse=True)
+        return render_template_string(PROMPTS_HTML, prompts=prompts_list)
+    except Exception as e:
+        return f"Prompts error: {str(e)}", 500
+
+@app.route('/analyses')
+def analyses():
+    """Call analyses list"""
+    try:
+        analyses_list = list(analyzer.call_analyses.values())
+        analyses_list.sort(key=lambda x: x.get('analyzed_at', ''), reverse=True)
+        
+        # Calculate stats
+        if analyses_list:
+            scores = [a.get('performance_score', 0) for a in analyses_list]
+            avg_score = sum(scores) / len(scores)
+            high_scores = len([s for s in scores if s >= 8])
+            low_scores = len([s for s in scores if s < 6])
+        else:
+            avg_score = 0
+            high_scores = 0
+            low_scores = 0
+        
+        return render_template_string(ANALYSES_HTML, 
+            analyses=analyses_list,
+            avg_score=avg_score,
+            high_scores=high_scores,
+            low_scores=low_scores
+        )
+    except Exception as e:
+        return f"Analyses error: {str(e)}", 500
+
+@app.route('/analysis/<call_id>')
+def detailed_analysis(call_id):
+    """Detailed analysis view"""
+    try:
+        if call_id in analyzer.call_analyses:
+            analysis = analyzer.call_analyses[call_id]
+            return render_template_string(DETAILED_HTML, analysis=analysis)
+        else:
+            return "Analysis not found", 404
+    except Exception as e:
+        return f"Analysis detail error: {str(e)}", 500
+
+# API Routes
+@app.route('/api/prompts', methods=['POST'])
+def add_prompt():
+    """Add a new system prompt"""
+    try:
+        data = request.get_json()
+        if not data or 'name' not in data or 'prompt' not in data:
+            return jsonify({"error": "Name and prompt are required"}), 400
+        
+        prompt_id = analyzer.add_system_prompt(data['name'], data['prompt'])
+        return jsonify({"message": "Prompt added successfully", "id": prompt_id})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/prompts/<prompt_id>/activate', methods=['POST'])
+def activate_prompt(prompt_id):
+    """Activate a system prompt"""
+    try:
+        if prompt_id not in analyzer.system_prompts:
+            return jsonify({"error": "Prompt not found"}), 404
+        
+        analyzer.activate_prompt(prompt_id)
+        return jsonify({"message": "Prompt activated successfully"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/prompts/<prompt_id>', methods=['DELETE'])
+def delete_prompt(prompt_id):
+    """Delete a system prompt"""
+    try:
+        if prompt_id not in analyzer.system_prompts:
+            return jsonify({"error": "Prompt not found"}), 404
+        
+        # Don't delete if it's the active prompt
+        if prompt_id == analyzer.active_prompt_id:
+            return jsonify({"error": "Cannot delete active prompt"}), 400
+        
+        del analyzer.system_prompts[prompt_id]
+        return jsonify({"message": "Prompt deleted successfully"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/analyze-recent', methods=['POST'])
+def analyze_recent_calls():
+    """Manually trigger analysis of recent calls"""
+    try:
+        active_prompt = analyzer.get_active_prompt()
+        if not active_prompt:
+            return jsonify({"error": "No active system prompt found"}), 400
+        
+        # Run async analysis in a new event loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            analyses = loop.run_until_complete(
+                analyzer.process_recent_calls(active_prompt, hours_back=24)
+            )
+            return jsonify({
+                "message": "Analysis completed successfully",
+                "analyzed_calls": len(analyses)
+            })
+        finally:
+            loop.close()
+            
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/analysis/<call_id>')
+def get_analysis(call_id):
+    """Get detailed analysis for a specific call"""
+    try:
+        if call_id in analyzer.call_analyses:
+            return jsonify(analyzer.call_analyses[call_id])
+        else:
+            return jsonify({"error": "Analysis not found"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/webhook/vapi', methods=['POST'])
+def vapi_webhook():
+    """Handle VAPI webhooks"""
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+        
+        print(f"Received webhook: {data.get('type', 'unknown')}")
+        
+        if data.get('type') == 'call-ended':
+            # Process in background to avoid timeout
+            def process_webhook():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    loop.run_until_complete(webhook_handler.handle_call_ended(data))
+                finally:
+                    loop.close()
+            
+            # Start background thread
+            thread = threading.Thread(target=process_webhook)
+            thread.daemon = True
+            thread.start()
+            
+            return jsonify({"message": "Webhook received, processing in background"})
+        
+        return jsonify({"message": "Webhook received"})
+    except Exception as e:
+        print(f"Webhook error: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/health')
+def health_check():
+    """Health check endpoint"""
+    return jsonify({
+        "status": "healthy",
+        "active_prompt": analyzer.active_prompt_id is not None,
+        "analyzed_calls": len(analyzer.call_analyses),
+        "system_prompts": len(analyzer.system_prompts)
+    })
+
+# Test endpoint for development
+@app.route('/api/test-analysis', methods=['POST'])
+def test_analysis():
+    """Test endpoint to simulate call analysis"""
+    try:
+        # Sample transcript for testing
+        sample_transcript = """
+        Agent: Hello, thank you for calling our customer service. My name is Sarah, how can I help you today?
+        
+        Customer: Hi, I'm having trouble with my recent order. I ordered a laptop but received the wrong model.
+        
+        Agent: I'm sorry to hear that happened. Let me help you resolve this right away. Can you please provide me with your order number?
+        
+        Customer: Yes, it's ORD-12345.
+        
+        Agent: Thank you. I can see your order here. You ordered the Dell XPS 13 but received the Dell Inspiron 15, is that correct?
+        
+        Customer: Yes, exactly.
+        
+        Agent: I sincerely apologize for this mix-up. I can arrange for a return pickup and send you the correct laptop immediately. We'll also expedite the shipping at no extra cost. Would that work for you?
+        
+        Customer: That sounds great, thank you so much for your help.
+        
+        Agent: Perfect! I've arranged the pickup for tomorrow between 9 AM and 5 PM, and your correct laptop will be shipped today with overnight delivery. You should receive it by tomorrow evening. Is there anything else I can help you with?
+        
+        Customer: No, that covers everything. Thank you for resolving this so quickly.
+        
+        Agent: You're very welcome! Thank you for your patience, and have a great day!
+        """
+        
+        # Get active system prompt
+        active_prompt = analyzer.get_active_prompt()
+        if not active_prompt:
+            return jsonify({"error": "No active system prompt found"}), 400
+        
+        # Run analysis
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            analysis = loop.run_until_complete(
+                analyzer.analyze_call_performance(
+                    sample_transcript, 
+                    active_prompt, 
+                    "test_call_001"
+                )
+            )
+            return jsonify({
+                "message": "Test analysis completed successfully",
+                "analysis": analysis
+            })
+        finally:
+            loop.close()
+            
+    except Exception as e:
+        return jsonify({"error": f"Test analysis failed: {str(e)}"}), 500
+
+if __name__ == '__main__':
+    app.run(debug=True)
